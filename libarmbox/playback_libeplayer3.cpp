@@ -14,6 +14,7 @@
 
 extern "C" {
 #include <common.h>
+#include <misc.h>
 	extern OutputHandler_t OutputHandler;
 	extern PlaybackHandler_t PlaybackHandler;
 	extern ContainerHandler_t ContainerHandler;
@@ -166,6 +167,7 @@ bool cPlayback::Start(char *filename, int vpid, int vtype, int apid, int ac3, in
 	 */
 	std::string keys = decryption_keys;
 	decryption_keys.clear(); /* only for this Start() */
+	std::string drmhandler_params = drmhandler_parameters;
 	size_t frag_pos = file.rfind('#');
 	if (frag_pos != std::string::npos)
 	{
@@ -177,11 +179,11 @@ bool cPlayback::Start(char *filename, int vpid, int vtype, int apid, int ac3, in
 		{
 			val = extractParam(hdrs, "User-Agent=");
 			if (!val.empty()) {
-				headers += "User-Agent: " + val + "\n";
+				headers += "User-Agent: " + val + "\r\n";
 			}
 			val = extractParam(hdrs, "Referer=");
 			if (!val.empty()) {
-				headers += "Referer: " + val + "\n";
+				headers += "Referer: " + val + "\r\n";
 			}
 			strip = !headers.empty();
 		}
@@ -204,19 +206,46 @@ bool cPlayback::Start(char *filename, int vpid, int vtype, int apid, int ac3, in
 	}
 	else if (isHTTP)
 	{
+		/* remove headers of a previous stream; an empty string would make
+		 * FFmpeg warn "No trailing CRLF found in HTTP header" on every request */
 		const char hkey[] = "headers";
-		ffmpeg_av_dict_set(hkey, "", 0);
+		ffmpeg_av_dict_set(hkey, NULL, 0);
 	}
 
 	/* always (re)set, so keys of a previous stream are not reused */
 	if (player && player->playback)
 	{
+		/* A fresh start supersedes any abort state left over from the stop of a
+		 * previous stream; without this the new open dies immediately in
+		 * ffmpeg's interrupt callback with AVERROR_EXIT. All cPlayback wrappers
+		 * share this one static context, so a stale flag kills every next open. */
+		player->playback->abortRequested = 0;
+PlaybackDieNow(2);
 		player->playback->maxVideoWidth = max_video_width > 0 ? max_video_width : 0;
 		player->playback->maxVideoHeight = max_video_height > 0 ? max_video_height : 0;
 		strncpy(player->playback->decryptionKeys, keys.c_str(), sizeof(player->playback->decryptionKeys) - 1);
 		player->playback->decryptionKeys[sizeof(player->playback->decryptionKeys) - 1] = '\0';
 		if (!keys.empty())
 			hal_info("%s - decryption key(s) set\n", __func__);
+		if (drmhandler_params.size() >= sizeof(player->playback->drmhandlerParameters))
+		{
+			/* a cut JSON object is unusable: drop it instead of handing on garbage */
+			hal_info("%s - drmhandler parameters too long (%zu bytes, max %zu), DRM disabled\n", __func__,
+				drmhandler_params.size(), sizeof(player->playback->drmhandlerParameters) - 1);
+			drmhandler_params.clear();
+		}
+		strncpy(player->playback->drmhandlerParameters, drmhandler_params.c_str(), sizeof(player->playback->drmhandlerParameters) - 1);
+		player->playback->drmhandlerParameters[sizeof(player->playback->drmhandlerParameters) - 1] = '\0';
+		if (!drmhandler_params.empty())
+		{
+			hal_info("%s - drmhandler parameters set\n", __func__);
+			/* DASH/DRM opens perform several sequential TLS fetches (manifest,
+			 * init section, first media chunk); the 4 s default open budget is
+			 * too short for that and interrupt_cb kills slow-but-alive sources
+			 * with AVERROR_EXIT. Give DRM opens a realistic budget. */
+			if (player->playback->httpTimeout < 20000)
+				player->playback->httpTimeout = 20000;
+		}
 	}
 
 	std::string szSecondFile;
@@ -680,6 +709,13 @@ void cPlayback::FindAllPids(uint16_t *apids, unsigned short *ac3flags, uint16_t 
 			free(TrackList);
 			*numpida = j;
 		}
+
+		/* the player picks the audio track itself (e.g. best rendition of an
+		 * adaptive stream): report that one via GetAPid() instead of 0 */
+		int playing_id = -1;
+		player->manager->audio->Command(player, MANAGER_GET, &playing_id);
+		if (playing_id >= 0)
+			mAudioStream = playing_id;
 	}
 }
 

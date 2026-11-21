@@ -37,6 +37,7 @@ class cPlayback
 		AVFormatContext *avft;
 		std::string extractParam(const std::string &hdrs, const std::string &paramName);
 		std::string decryption_keys;
+		std::string drmhandler_parameters;
 		int max_video_width;
 		int max_video_height;
 	public:
@@ -51,6 +52,9 @@ class cPlayback
 		 * a single default "key", hex or base64url; "#decryption_keys=" in the
 		 * url takes precedence */
 		void SetDecryptionKeys(const std::string &keys) { decryption_keys = keys; }
+		/* drmhandler parameters (JSON string, see container_drmhandler.h),
+		 * valid for all following Start() */
+		void SetDrmHandlerParameters(const std::string &parameters) { drmhandler_parameters = parameters; }
 		/* max. video size when choosing the variant/representation of
 		 * HLS/DASH streams, 0 = unlimited; kept for all following Start() */
 		void SetMaxVideoResolution(int width, int height = 0) { max_video_width = width; max_video_height = height; }
