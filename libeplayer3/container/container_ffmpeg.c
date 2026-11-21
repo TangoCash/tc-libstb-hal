@@ -27,6 +27,7 @@
 /* Includes                      */
 /* ***************************** */
 #include "debug.h"
+#include "container_drmhandler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,7 @@
 #include <unistd.h>
 #include <memory.h>
 #include <string.h>
+#include <strings.h>
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -46,6 +48,7 @@
 #include <sys/prctl.h>
 
 #include <ffmpeg/mpeg4audio.h>
+#include <libavutil/avstring.h>
 #include <libavutil/base64.h>
 #include <libavutil/bprint.h>
 
@@ -2239,19 +2242,68 @@ static void FFMPEGThread(Context_t *context)
 /* Container part for ffmpeg    */
 /* **************************** */
 
+/* FFmpeg's own diagnostics (av_log) go to stderr by default, which is not visible
+ * on this platform. Route WARNING and above into the HAL log channel so demuxer /
+ * protocol failures (DASH manifest parse errors, http gzip/zlib warnings, ...) are
+ * diagnosable; INFO and below are filtered out as too noisy for a long-running player.
+ */
+static void ffmpeg_av_log_cb(void *avcl, int level, const char *fmt, va_list vl)
+{
+	char buf[512];
+	const char *line;
+	size_t len;
+
+	(void)avcl;
+	if (level >= AV_LOG_INFO)
+		return;
+	vsnprintf(buf, sizeof(buf), fmt, vl);
+	line = buf;
+	while (*line == ' ' || *line == '\t')
+		line++;
+	len = strlen(line);
+	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+		len--;
+	if (len)
+		hal_info("[ffmpeg] %.*s\n", (int)len, line);
+}
+
+/* overall open/probe deadline = httpTimeout * OPEN_DEADLINE_FACTOR */
+#define OPEN_DEADLINE_FACTOR 4
+
 static int32_t terminating = 0;
+/* Log the abort trigger once per episode: FFmpeg polls this callback in tight
+ * loops, and a stale flag left over from an earlier stop would otherwise be
+ * invisible (the open just fails with AVERROR_EXIT). */
+static int32_t interruptAbortLogged = 0;
 static int32_t interrupt_cb(void *ctx)
 {
 	PlaybackHandler_t *p = (PlaybackHandler_t *)ctx;
 	if (p->abortRequested || PlaybackDieNow(0))
+	{
+		if (!interruptAbortLogged)
+		{
+			/* Note: ffmpeg_err() is compiled out via FFMPEG_SILENT — use the
+			 * level-gated ffmpeg_printf(), which reaches the HAL log. */
+			ffmpeg_printf(1, "interrupt_cb: abort active, open aborted (abortRequested=%u dieNow=%d)\n",
+			              p->abortRequested, (int32_t)PlaybackDieNow(0));
+			interruptAbortLogged = 1;
+		}
 		return 1;
+	}
+	interruptAbortLogged = 0;
 	if (p->openStartTimeUs > 0 && p->httpTimeout > 0)
 	{
+		/* Stalled connections are already cut by the per-request http "timeout"
+		 * option (httpTimeout). This is the overall cap for the whole open/probe:
+		 * multi-variant HLS reads the first segment of every variant (up to 2160p)
+		 * while opening, which can legitimately take longer than one request. */
+		int64_t limit_ms = (int64_t)p->httpTimeout * OPEN_DEADLINE_FACTOR;
 		int64_t elapsed_us = av_gettime() - p->openStartTimeUs;
-		if (elapsed_us > (int64_t)p->httpTimeout * 1000)
+		if (elapsed_us > limit_ms * 1000)
 		{
-			ffmpeg_err("interrupt_cb: open/probe timeout after %" PRId64 " ms (limit %u ms)\n",
-				elapsed_us / 1000, p->httpTimeout);
+			/* ffmpeg_err() is compiled out via FFMPEG_SILENT — keep this visible. */
+			ffmpeg_printf(2, "interrupt_cb: open/probe timeout after %" PRId64 " ms (limit %" PRId64 " ms)\n",
+			              elapsed_us / 1000, limit_ms);
 			return 1;
 		}
 	}
@@ -2417,10 +2469,32 @@ AVIOContext *container_ffmpeg_get_avio_context(CustomIOCtx_t *custom_io, size_t 
 }
 #endif
 
+/* Errors that indicate a transient network/CDN-edge failure rather than a permanent
+ * problem with the URL or its format: worth one bounded retry of avformat_open_input(). */
+static int open_err_transient(int err)
+{
+	return err == AVERROR_INVALIDDATA ||
+	       err == AVERROR_HTTP_SERVER_ERROR ||
+	       err == AVERROR(EAGAIN) ||
+	       err == AVERROR(ETIMEDOUT) ||
+	       err == AVERROR(ECONNRESET);
+}
+
 int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uint64_t fileSize, char *moovAtomFile, uint64_t moovAtomOffset, int32_t AVIdx)
 {
 	int32_t err = 0;
 	AVInputFormat *fmt = NULL;
+
+	/* Generation probe: proves this build is the one running and shows exactly what
+	 * the options dict held before we touch it. The glue layer pre-sets "headers" to
+	 * an empty string for plain HTTP streams, so distinguish missing/empty/set — all
+	 * three affect how the gzip declaration below is applied. */
+	{
+		const AVDictionaryEntry *he = av_dict_get(g_avio_opts, "headers", NULL, 0);
+
+		ffmpeg_printf(2, "init probe: open %s [pre_headers=%s]\n",
+		              filename, he == NULL ? "(missing)" : (he->value[0] != '\0' ? he->value : "(empty)"));
+	}
 	avContextTab[AVIdx] = avformat_alloc_context();
 	if (avContextTab[AVIdx] != NULL)
 	{
@@ -2458,9 +2532,58 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
 	}
 #endif
 
+	/* Some DRM manifest servers (CDN edges) reject HTTP requests that do
+	 * not declare gzip support with 406, so make ffmpeg's http client announce the
+	 * capability for such sources; it inflates the response itself when the server
+	 * actually compresses (requires an ffmpeg built with zlib). The glue layer may
+	 * pre-set "headers" and channel scripts may provide their own
+	 * header lines — both are merged with instead of skipping this declaration. */
+	{
+		const char *dhParams = (context->playback && context->playback->drmhandlerParameters[0]) ?
+		                       context->playback->drmhandlerParameters : getenv("LIBEPLAYER3_DRMHANDLER_PARAMETERS");
+
+		if (dhParams != NULL && dhParams[0] != '\0')
+		{
+			const AVDictionaryEntry *he = av_dict_get(g_avio_opts, "headers", NULL, 0);
+			const char *prev = (he != NULL) ? he->value : "";
+
+			if (av_stristr(prev, "accept-encoding") == NULL && strlen(prev) < sizeof("Accept-Encoding: gzip\r\n") + 480u)
+			{
+				char hdrs[512];
+				size_t plen = strlen(prev);
+
+				snprintf(hdrs, sizeof(hdrs), "%s%sAccept-Encoding: gzip\r\n",
+				         prev, (plen > 0 && prev[plen - 1] != '\n') ? "\r\n" : "");
+				ffmpeg_av_dict_set("headers", hdrs, 0);
+				ffmpeg_printf(2, "Accept-Encoding headers enabled for DRM source (%zu pre-set header byte(s))\n", plen);
+			}
+			else if (av_stristr(prev, "accept-encoding") != NULL)
+			{
+				ffmpeg_printf(3, "Accept-Encoding already declared in pre-set headers\n");
+			}
+		}
+	}
+
 	AVDictionary *avio_opts = NULL;
 	AVDictionary **pavio_opts = NULL;
 	av_dict_copy(&avio_opts, g_avio_opts, 0);
+
+	if (context->playback && !context->playback->decryptionKeys[0])
+	{
+		const char *drmhandlerParameters = context->playback->drmhandlerParameters[0] ?
+		                            context->playback->drmhandlerParameters : getenv("LIBEPLAYER3_DRMHANDLER_PARAMETERS");
+
+		if (drmhandlerParameters != NULL && drmhandlerParameters[0] != '\0')
+		{
+			char fetchedKeys[sizeof(context->playback->decryptionKeys)] = "";
+			int32_t nkeys = container_drmhandler_resolve(filename, drmhandlerParameters,
+			                                        fetchedKeys, sizeof(fetchedKeys));
+
+			if (nkeys > 0)
+				av_strlcpy(context->playback->decryptionKeys, fetchedKeys,
+				           sizeof(context->playback->decryptionKeys));
+		}
+	}
 
 	if (context->playback && context->playback->decryptionKeys[0])
 	{
@@ -2699,34 +2822,80 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
 	pavio_opts = &avio_opts;
 
 	context->playback->openStartTimeUs = av_gettime();
-	if (avContextTab[AVIdx] != NULL && ((err = avformat_open_input(&avContextTab[AVIdx], filename, fmt, pavio_opts)) != 0))
+	/* Some streaming CDNs intermittently return non-media responses while their origin is
+	 * degraded - an "upstream error" page under a success status (the probe then fails with
+	 * AVERROR_INVALIDDATA and logs nothing) or hard 5xx errors. For http(s) URLs retry the
+	 * open a bounded number of times so transient edge failures self-heal instead of surfacing
+	 * as an opaque "Invalid data" on the first bad response. avformat_open_input() frees and
+	 * NULLs the context on failure, so each attempt starts clean; recreate it with the same
+	 * interrupt callback between attempts. */
+	if (avContextTab[AVIdx] != NULL)
 	{
-		if (rtmp_proto_impl == 0 && //err == AVERROR_UNKNOWN &&
-			rtmpProtoImplType == RTMP_NATIVE &&
-			numOfRTMPImpl > 1)
+		int maxAttempts = 1;
+		int attempt;
+		int waited;
+
+		if (strncmp(filename, "http://", 7) == 0 || strncmp(filename, "https://", 8) == 0)
+			maxAttempts = 3;
+
+		for (attempt = 1; attempt <= maxAttempts && avContextTab[AVIdx] != NULL; attempt++)
 		{
-			// retry with librtmp
-			err = avformat_open_input(&avContextTab[AVIdx], filename + 2, fmt, pavio_opts);
-			// filename2 - another memory leak, and also only once, so does not matter
-		}
+			/* Each retry attempt gets its own full HTTP open-timeout budget. */
+			context->playback->openStartTimeUs = av_gettime();
+			if ((err = avformat_open_input(&avContextTab[AVIdx], filename, fmt, pavio_opts)) == 0)
+				break;
 
-		if (err != 0)
-		{
-			context->playback->openStartTimeUs = 0;
-			char error[512];
-
-			ffmpeg_err("avformat_open_input failed %d (%s)\n", err, filename);
-			av_strerror(err, error, 512);
-			context->playback->lastOpenErrorCode = err;
-			snprintf(context->playback->lastOpenErrorMessage, PLAYBACK_LAST_ERROR_MSG_SIZE, "%s", error);
-			E2iSendMsg("{\"FF_ERROR\":{\"msg\":\"%s\",\"code\":%i}}\n", error, err);
-
-			if (avio_opts != NULL)
+			if (rtmp_proto_impl == 0 && //err == AVERROR_UNKNOWN &&
+			    rtmpProtoImplType == RTMP_NATIVE &&
+			    numOfRTMPImpl > 1)
 			{
-				av_dict_free(&avio_opts);
+				// retry with librtmp
+				err = avformat_open_input(&avContextTab[AVIdx], filename + 2, fmt, pavio_opts);
+				if (err == 0)
+					break;
 			}
-			return cERR_CONTAINER_FFMPEG_OPEN;
+
+			if (attempt < maxAttempts && open_err_transient(err))
+			{
+				int64_t el_us = av_gettime() - context->playback->openStartTimeUs;
+
+				ffmpeg_printf(1, "avformat_open_input attempt %d/%d failed err=%d elapsed_ms=%" PRId64 ", retrying in 2s\n",
+				              attempt, maxAttempts, err, el_us / 1000);
+				/* Sleep in small slices so an abort during the backoff is honored promptly. */
+				for (waited = 0; waited < 2000 && !context->playback->abortRequested && PlaybackDieNow(0) == 0; waited += 100)
+					usleep(100 * 1000);
+
+				avContextTab[AVIdx] = avformat_alloc_context();
+				if (avContextTab[AVIdx])
+				{
+					avContextTab[AVIdx]->interrupt_callback.callback = interrupt_cb;
+					avContextTab[AVIdx]->interrupt_callback.opaque = context->playback;
+				}
+			}
 		}
+	}
+
+	if (err != 0)
+	{
+		{
+			int64_t el_us = (context->playback->openStartTimeUs > 0) ? av_gettime() - context->playback->openStartTimeUs : 0;
+
+			ffmpeg_printf(2, "avformat_open_input failed err=%d abortRequested=%u dieNow=%d httpTimeout=%u elapsed_ms=%" PRId64 "\n",
+			              err, context->playback->abortRequested, (int32_t)PlaybackDieNow(0), context->playback->httpTimeout, el_us / 1000);
+		}
+		context->playback->openStartTimeUs = 0;
+		char error[512];
+
+		av_strerror(err, error, 512);
+		context->playback->lastOpenErrorCode = err;
+		snprintf(context->playback->lastOpenErrorMessage, PLAYBACK_LAST_ERROR_MSG_SIZE, "%s", error);
+		E2iSendMsg("{\"FF_ERROR\":{\"msg\":\"%s\",\"code\":%i}}\n", error, err);
+
+		if (avio_opts != NULL)
+		{
+			av_dict_free(&avio_opts);
+		}
+		return cERR_CONTAINER_FFMPEG_OPEN;
 	}
 	context->playback->openStartTimeUs = 0;
 	if (avContextTab[AVIdx] != NULL)
@@ -2951,6 +3120,7 @@ int32_t container_ffmpeg_init(Context_t *context, PlayFiles_t *playFilesNames)
 	/* initialize ffmpeg */
 	wrapped_register_all();
 	avformat_network_init();
+		av_log_set_callback(ffmpeg_av_log_cb);
 
 #if FFMPEG_DEBUG_LEVEL >= 10
 	av_log_set_flags(AV_LOG_SKIP_REPEATED);
@@ -3292,13 +3462,28 @@ static void select_best_adaptive_streams(uint32_t cAVIdx, AVFormatContext *ctx, 
 	}
 }
 
+/* Language code for comparisons: codes from the ISO 639-2 local-use range
+ * written as 'q' + two-letter code (e.g. "qde" for a German Dolby track)
+ * count as that language. */
+static const char *audio_base_lang(const char *l)
+{
+	if (l && l[0] == 'q' && strlen(l) == 3)
+		return l + 1;
+	return l;
+}
+
+static int audio_lang_matches(const AVDictionaryEntry *e, const char *lang)
+{
+	return e && e->value && !strcasecmp(audio_base_lang(e->value), audio_base_lang(lang));
+}
+
 /* > 0 if audio stream a is a better default than b */
 static int audio_stream_better(const AVFormatContext *ctx, AVStream *a, AVStream *b, const char *lang)
 {
 	AVDictionaryEntry *la = av_dict_get(a->metadata, "language", NULL, 0);
 	AVDictionaryEntry *lb = av_dict_get(b->metadata, "language", NULL, 0);
-	int ma = lang ? (la && !strcmp(la->value, lang)) : 1;
-	int mb = lang ? (lb && !strcmp(lb->value, lang)) : 1;
+	int ma = lang ? audio_lang_matches(la, lang) : 1;
+	int mb = lang ? audio_lang_matches(lb, lang) : 1;
 	int da = stream_disposition_score(a);
 	int db = stream_disposition_score(b);
 	int ca = stream_audio_channels(a);
@@ -3314,7 +3499,11 @@ static int audio_stream_better(const AVFormatContext *ctx, AVStream *a, AVStream
 		return da > db;
 	if (ca != cb)
 		return ca > cb;
-	return ba > bb;
+	if (ba != bb)
+		return ba > bb;
+	/* same bitrate: prefer AC3 over AAC */
+	return get_codecpar(a)->codec_id == AV_CODEC_ID_AC3 &&
+	       get_codecpar(b)->codec_id == AV_CODEC_ID_AAC;
 }
 
 int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32_t initial)
@@ -3504,6 +3693,23 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
 			if (!stream->id)
 			{
 				stream->id = n;
+			}
+			else
+			{
+				/* Packets are routed to tracks by stream id. hls.c sets the id to the
+				 * playlist index, so audio and video of one muxed TS variant share it
+				 * and audio packets would be fed to the video track. Make it unique. */
+				uint32_t j;
+				for (j = 0; j < n; j++)
+				{
+					if (avContext->streams[j]->id == stream->id)
+					{
+						ffmpeg_printf(1, "stream %u: id %d already used by stream %u, using 0x%x\n",
+						              n, stream->id, j, 0x10000 + n);
+						stream->id = 0x10000 + n;
+						break;
+					}
+				}
 			}
 
 			/* some values in track are unset and therefor copyTrack segfaults.
@@ -4416,6 +4622,23 @@ static int32_t container_ffmpeg_switch_audio(Context_t *context, int32_t *arg __
 		}
 	}
 	releaseMutex(__FILE__, __FUNCTION__, __LINE__);
+
+	/* HLS/DASH pick up the changed discard flags on the next read and fetch the
+	 * new rendition themselves; on a live (non-seekable) stream the seek only
+	 * stalls reading until the frontend restarts the stream, which then falls
+	 * back to the automatically chosen track. Seek only where it can work.
+	 * The new rendition starts at the download position, which is ahead of the
+	 * playback position by everything still buffered in the decoders, so drop
+	 * that buffer: playback jumps forward (closer to live) and the new audio is
+	 * heard at once instead of only when playback reaches its first packet. */
+	if (avContextTab[0] && (isAdaptiveInput(avContextTab[0]) ||
+	    !avContextTab[0]->pb || !(avContextTab[0]->pb->seekable & AVIO_SEEKABLE_NORMAL)))
+	{
+		ffmpeg_printf(1, "switch audio to track %d without seek (adaptive or live input), clearing output buffers\n", *arg);
+		if (context->output)
+			context->output->Command(context, OUTPUT_CLEAR, NULL);
+		return cERR_CONTAINER_FFMPEG_NO_ERROR;
+	}
 
 	/* Hellmaster1024: nothing to do here! */
 	int64_t sec = -3;

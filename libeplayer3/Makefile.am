@@ -13,6 +13,8 @@ AM_CXXFLAGS   = -fno-rtti -fno-exceptions -fno-strict-aliasing
 
 SOURCE_FILES  = container/container.c
 SOURCE_FILES += container/container_ffmpeg.c
+SOURCE_FILES += container/container_drmhandler.c
+SOURCE_FILES += container/container_drm.c
 SOURCE_FILES += manager/manager.c
 SOURCE_FILES += manager/audio.c
 SOURCE_FILES += manager/video.c
@@ -65,7 +67,7 @@ SOURCE_FILES += \
 
 libeplayer3_la_SOURCES = $(SOURCE_FILES)
 
-LIBEPLAYER3_LIBS = libeplayer3.la -lswscale -ldl -lpthread -lavformat -lavcodec -lavutil -lswresample
+LIBEPLAYER3_LIBS = libeplayer3.la -lswscale -ldl -lpthread -lavformat -lavcodec -lavutil -lswresample -lcurl -lz -lcrypto
 
 #bin_PROGRAMS = eplayer3
 #eplayer3_SOURCES = main/exteplayer.c
