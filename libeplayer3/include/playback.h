@@ -6,6 +6,8 @@
 
 #define PLAYBACK_LAST_ERROR_MSG_SIZE 512
 #define PLAYBACK_DECRYPTION_KEYS_SIZE 1024
+/* JSON with license headers; a license token header (e.g. a JWT) alone can exceed 1 KiB */
+#define PLAYBACK_DRMHANDLER_PARAMETERS_SIZE 8192
 
 typedef void(* PlaybackDieNowCallback)();
 bool PlaybackDieNowRegisterCallback(PlaybackDieNowCallback callback);
@@ -87,6 +89,10 @@ typedef struct PlaybackHandler_s
 	int32_t maxVideoWidth;
 	int32_t maxVideoHeight;
 	int64_t maxVideoBitrate; // bit/s
+
+	/* drmhandler parameters (JSON string, see container_drmhandler.h),
+	 * "" = disabled */
+	char drmhandlerParameters[PLAYBACK_DRMHANDLER_PARAMETERS_SIZE];
 } PlaybackHandler_t;
 
 #endif

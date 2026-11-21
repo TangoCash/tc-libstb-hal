@@ -1040,5 +1040,6 @@ PlaybackHandler_t PlaybackHandler =
 	"",         //decryptionKeys
 	0,          //maxVideoWidth
 	0,          //maxVideoHeight
-	0           //maxVideoBitrate
+	0,          //maxVideoBitrate
+	""           //drmhandlerParameters
 };
