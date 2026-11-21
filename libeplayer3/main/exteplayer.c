@@ -412,7 +412,7 @@ static int ParseParams(int argc, char *argv[], PlayFiles_t *playbackFiles, int *
 {
 	int ret = 0;
 	int c;
-	while ((c = getopt(argc, argv, "G:W:H:A:V:U:we3dlsrimva:n:x:u:c:h:o:p:P:t:9:0:1:4:f:b:F:S:O:T:K:R:")) != -1)
+	while ((c = getopt(argc, argv, "G:W:H:A:V:U:we3dlsrimva:n:x:u:c:h:o:p:P:t:9:0:1:4:f:b:F:S:O:T:K:L:R:")) != -1)
 	{
 		switch (c)
 		{
@@ -529,6 +529,13 @@ static int ParseParams(int argc, char *argv[], PlayFiles_t *playbackFiles, int *
 			case 'K':
 				strncpy(PlaybackHandler.decryptionKeys, optarg, sizeof(PlaybackHandler.decryptionKeys) - 1);
 				PlaybackHandler.decryptionKeys[sizeof(PlaybackHandler.decryptionKeys) - 1] = '\0';
+				break;
+			case 'L':
+				if (optarg[0] != '\0')
+				{
+					strncpy(PlaybackHandler.drmhandlerParameters, optarg, sizeof(PlaybackHandler.drmhandlerParameters) - 1);
+					PlaybackHandler.drmhandlerParameters[sizeof(PlaybackHandler.drmhandlerParameters) - 1] = '\0';
+				}
 				break;
 			case 'c':
 				printf("For now cookies should be set via headers option!\n");
@@ -675,6 +682,7 @@ int main(int argc, char *argv[])
 		printf("[-u user-agent] set custom http User-Agent header\n");
 		printf("[-R width[xheight]] max. video size when choosing the HLS/DASH variant (0 = unlimited)\n");
 		printf("[-K kid:key[,kid:key...]|key] CENC/ClearKey decryption keys (hex or base64url)\n");
+		printf("[-L drmhandler-parameters] JSON string (wv_device, license_url, license_headers; see container_drmhandler.h)\n");
 		printf("[-c cookies] set cookies - not working at now, please use -h instead\n");
 		printf("[-x separateAudioUri]\n");
 		printf("[-0 idx] video MPEG-DASH representation index\n");
