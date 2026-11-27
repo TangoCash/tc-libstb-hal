@@ -87,6 +87,7 @@ hdmi_cec::hdmi_cec()
 	fallback = false;
 	tv_off = true;
 	active_source = false;
+	other_source = false;
 	event_callback = NULL;
 	deviceType = CEC_LOG_ADDR_TYPE_UNREGISTERED;
 	audio_destination = CEC_OP_PRIM_DEVTYPE_AUDIOSYSTEM;
@@ -218,6 +219,13 @@ bool hdmi_cec::SetCECMode(VIDEO_HDMI_CEC_MODE _deviceType)
 			if (ioctl(hdmiFd, CEC_S_MODE, &monitor) < 0)
 				hal_info(RED "[CEC] %s: monitor failed (%m)\n" NORMAL, __func__);
 
+			/* Opened blocking so the logical address above is claimed before
+			   anything is sent; from here on a transmit only queues the message
+			   and its result comes back through CEC_RECEIVE, so no caller waits
+			   for the bus (as in openATV enigma2). */
+			int flags = fcntl(hdmiFd, F_GETFL);
+			if (flags < 0 || fcntl(hdmiFd, F_SETFL, flags | O_NONBLOCK) < 0)
+				hal_info(RED "[CEC] %s: non-blocking mode failed (%m)\n" NORMAL, __func__);
 		}
 	}
 
@@ -348,6 +356,7 @@ void hdmi_cec::SourceChange(const unsigned char *path, const char *what)
 	{
 		hal_info(GREEN "[CEC] %s %02X%02X: switched to the box\n" NORMAL, what, path[0], path[1]);
 		active_source = true;
+		other_source = false;
 		if (standby)
 			Notify(VIDEO_HDMI_CEC_EVENT_WAKEUP);
 		SendActiveSource();
@@ -358,7 +367,44 @@ void hdmi_cec::SourceChange(const unsigned char *path, const char *what)
 		if (active_source && !standby)
 			Notify(VIDEO_HDMI_CEC_EVENT_SLEEP);
 		active_source = false;
+		other_source = true;
 	}
+}
+
+/* The kernel tells of a new state of the adapter, mostly a new physical address
+   when the television appears on HDMI or goes away (from openATV/OpenPLi enigma2).
+   Without this a box started while the television was off stays without an
+   address until it is restarted. */
+void hdmi_cec::HandleStateChange()
+{
+	bool changed = false;
+	for (int i = 0; i < 16; i++)
+	{
+		struct cec_event ev;
+		memset(&ev, 0, sizeof(ev));
+		if (::ioctl(hdmiFd, CEC_DQEVENT, &ev) < 0)
+			break;
+		if (ev.event == CEC_EVENT_STATE_CHANGE)
+		{
+			hal_info(GREEN "[CEC] state change: physical address %04X, logical addresses 0x%X\n" NORMAL, ev.state_change.phys_addr, ev.state_change.log_addr_mask);
+			changed = true;
+		}
+		else if (ev.event == CEC_EVENT_LOST_MSGS)
+			hal_info(RED "[CEC] lost %u messages\n" NORMAL, ev.lost_msgs.lost_msgs);
+	}
+	if (changed)
+		GetCECAddressInfo();
+}
+
+void hdmi_cec::ReplyDeckStatus(unsigned char destination)
+{
+	struct cec_message txmessage;
+	txmessage.initiator = logicalAddress;
+	txmessage.destination = destination;
+	txmessage.data[0] = CEC_MSG_DECK_STATUS;
+	txmessage.data[1] = CEC_OP_DECK_INFO_STOP;
+	txmessage.length = 2;
+	SendCECMessage(txmessage);
 }
 
 void hdmi_cec::SendCECMessage(struct cec_message &txmessage, int sleeptime)
@@ -379,8 +425,9 @@ void hdmi_cec::SendCECMessage(struct cec_message &txmessage, int sleeptime)
 			cec_msg_init(&msg, txmessage.initiator, txmessage.destination);
 			memcpy(&msg.msg[1], txmessage.data, txmessage.length);
 			msg.len = txmessage.length + 1;
-			/* blocking: returns once the message is sent, no pause needed */
-			ioctl(hdmiFd, CEC_TRANSMIT, &msg);
+			/* queued, the result comes back through CEC_RECEIVE */
+			if (ioctl(hdmiFd, CEC_TRANSMIT, &msg) < 0)
+				hal_info(RED "[CEC] transmit '%s' failed (%m)\n" NORMAL, ToString((cec_opcode)txmessage.data[0]));
 		}
 		else
 		{
@@ -410,7 +457,9 @@ void hdmi_cec::SetCECState(bool state)
 
 	standby = state;
 
-	if ((standby_cec_activ) && state)
+	if ((standby_cec_activ) && state && other_source)
+		hal_info(GREEN "[CEC] the television shows another source, leaving it on\n" NORMAL);
+	else if ((standby_cec_activ) && state)
 	{
 		message.initiator = logicalAddress;
 		message.destination = CEC_OP_PRIM_DEVTYPE_TV;
@@ -466,6 +515,7 @@ void hdmi_cec::SetCECState(bool state)
 		GetCECAddressInfo();
 
 		active_source = true;
+		other_source = false;
 		SendActiveSource();
 
 		message.initiator = logicalAddress;
@@ -662,7 +712,8 @@ void hdmi_cec::run()
 	int epollfd = epoll_create1(0);
 	struct epoll_event event;
 	event.data.fd = hdmiFd;
-	event.events = EPOLLIN;
+	// EPOLLPRI: the kernel's state changes (address) on /dev/cec0
+	event.events = fallback ? (EPOLLIN | EPOLLPRI) : EPOLLIN;
 
 	epoll_ctl(epollfd, EPOLL_CTL_ADD, hdmiFd, &event);
 
@@ -677,6 +728,8 @@ void hdmi_cec::run()
 		n = epoll_wait(epollfd, events.data(), EPOLL_MAX_EVENTS, EPOLL_WAIT_TIMEOUT);
 		for (int i = 0; i < n; ++i)
 		{
+			if (events[i].events & EPOLLPRI)
+				HandleStateChange();
 			if (events[i].events & EPOLLIN)
 				Receive(events[i].events);
 		}
@@ -695,7 +748,18 @@ void hdmi_cec::Receive(int what)
 		if (fallback)
 		{
 			struct cec_msg msg;
-			if (::ioctl(hdmiFd, CEC_RECEIVE, &msg) >= 0)
+			memset(&msg, 0, sizeof(msg));
+			if (::ioctl(hdmiFd, CEC_RECEIVE, &msg) < 0)
+				return;
+			/* the result of one of our own non-blocking transmits */
+			if (msg.sequence && msg.tx_status)
+			{
+				if (!(msg.tx_status & CEC_TX_STATUS_OK))
+					hal_info(RED "[CEC] transmit '%s' to %X failed (status 0x%02X, nack %u)\n" NORMAL,
+						msg.len > 1 ? ToString((cec_opcode)msg.msg[1]) : "poll", cec_msg_destination(&msg), msg.tx_status, msg.tx_nack_cnt);
+				return;
+			}
+			if ((msg.rx_status & CEC_RX_STATUS_OK) && msg.len >= 2 && msg.len <= CEC_MAX_MSG_SIZE)
 			{
 				rxmessage.length = msg.len - 1;
 				rxmessage.initiator = cec_msg_initiator(&msg);
@@ -743,6 +807,12 @@ void hdmi_cec::Receive(int what)
 						Notify(VIDEO_HDMI_CEC_EVENT_WAKEUP);
 					if (!standby || active_source)
 						SendActiveSource();
+					break;
+				}
+				case CEC_OPCODE_GIVE_DECK_STATUS:
+				{
+					// asked by Samsung televisions; the box plays no tape
+					ReplyDeckStatus(rxmessage.initiator);
 					break;
 				}
 				case CEC_OPCODE_ACTIVE_SOURCE:

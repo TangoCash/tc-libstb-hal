@@ -80,6 +80,9 @@ class hdmi_cec : public OpenThreads::Thread
 		bool fallback;
 		bool tv_off;
 		bool active_source;
+		bool other_source;	// another device is known to be the active source
+		void HandleStateChange();
+		void ReplyDeckStatus(unsigned char destination);
 		unsigned char audio_destination;
 		void (*event_callback)(int);
 		void SendActiveSource();
