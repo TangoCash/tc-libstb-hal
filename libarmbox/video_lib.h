@@ -149,6 +149,16 @@ typedef enum
 	VIDEO_HDMI_CEC_VOL_TV = 2
 } VIDEO_HDMI_CEC_VOL;
 
+/* What the television asks of the box over CEC, handed to the callback set
+   with cVideo::SetCECEventCallback. It runs on the CEC thread; the receiver
+   decides by its own settings whether to act. */
+typedef enum
+{
+	VIDEO_HDMI_CEC_EVENT_WAKEUP = 1,	// the television switched to the box
+	VIDEO_HDMI_CEC_EVENT_SLEEP = 2,		// the television switched away or went to standby
+	VIDEO_HDMI_CEC_EVENT_POWER = 3		// power key on the television's remote
+} VIDEO_HDMI_CEC_EVENT;
+
 typedef enum
 {
 	VIDEO_CONTROL_BRIGHTNESS = 0,
@@ -266,6 +276,7 @@ class cVideo
 		void SetCECAutoStandby(bool);
 		int GetAudioDestination();
 		void SetAudioDestination(int audio_dest);
+		void SetCECEventCallback(void (*callback)(int));
 		bool ShowPicture(const char *fname);
 		void StopPicture();
 		void Standby(unsigned int bOn);

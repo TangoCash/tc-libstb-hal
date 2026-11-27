@@ -1612,3 +1612,8 @@ void cVideo::SetAudioDestination(int audio_dest)
 {
 	hdmi_cec::getInstance()->SetAudioDestination(audio_dest);
 }
+
+void cVideo::SetCECEventCallback(void (*callback)(int))
+{
+	hdmi_cec::getInstance()->SetEventCallback(callback);
+}

@@ -86,6 +86,8 @@ hdmi_cec::hdmi_cec()
 	volume = 0;
 	fallback = false;
 	tv_off = true;
+	active_source = false;
+	event_callback = NULL;
 	deviceType = CEC_LOG_ADDR_TYPE_UNREGISTERED;
 	audio_destination = CEC_OP_PRIM_DEVTYPE_AUDIOSYSTEM;
 }
@@ -221,11 +223,9 @@ bool hdmi_cec::SetCECMode(VIDEO_HDMI_CEC_MODE _deviceType)
 
 	if (hdmiFd >= 0)
 	{
-		GetCECAddressInfo();
-
-		if (autoview_cec_activ)
-			SetCECState(false);
-
+		/* The address and the announcement (view on, active source, ...)
+		   follow on the CEC thread, so the caller does not wait for the bus
+		   (from neutrino-tangos evo). */
 		Start();
 		return true;
 
@@ -287,6 +287,12 @@ void hdmi_cec::GetCECAddressInfo()
 		{
 			deviceType = addressinfo.type;
 			logicalAddress = addressinfo.logical;
+			// 0.0.0.0 is the television itself, never the box (from neutrino-tangos evo)
+			if (addressinfo.physical[0] == 0x00 && addressinfo.physical[1] == 0x00)
+			{
+				hal_info(RED "[CEC] %s: physical address 0000 is wrong, skipping\n" NORMAL, __func__);
+				return;
+			}
 			if (memcmp(physicalAddress, addressinfo.physical, sizeof(physicalAddress)))
 			{
 				hal_info(GREEN "[CEC] %s: detected physical address change: %02X%02X --> %02X%02X\n" NORMAL, __func__, physicalAddress[0], physicalAddress[1], addressinfo.physical[0], addressinfo.physical[1]);
@@ -308,6 +314,51 @@ void hdmi_cec::ReportPhysicalAddress()
 	txmessage.data[3] = deviceType;
 	txmessage.length = 4;
 	SendCECMessage(txmessage);
+}
+
+void hdmi_cec::SendActiveSource()
+{
+	struct cec_message txmessage;
+	txmessage.initiator = logicalAddress;
+	txmessage.destination = CEC_LOG_ADDR_BROADCAST;
+	txmessage.data[0] = CEC_MSG_ACTIVE_SOURCE;
+	txmessage.data[1] = physicalAddress[0];
+	txmessage.data[2] = physicalAddress[1];
+	txmessage.length = 3;
+	SendCECMessage(txmessage);
+}
+
+void hdmi_cec::Notify(VIDEO_HDMI_CEC_EVENT event)
+{
+	hal_info(GREEN "[CEC] event %d (standby %d, active source %d)\n" NORMAL, (int)event, standby, active_source);
+	if (event_callback)
+		event_callback((int)event);
+}
+
+/* The television switched its input (active source, stream path or routing
+   change, from neutrino-tangos evo): to the box wakes it, away from it, while
+   it was the source, may put it to sleep. The receiver of the event decides by
+   its settings. */
+void hdmi_cec::SourceChange(const unsigned char *path, const char *what)
+{
+	if (physicalAddress[0] == 0xff && physicalAddress[1] == 0xff)
+		return; // the box has no address on the bus, so nothing is about it
+
+	if (path[0] == physicalAddress[0] && path[1] == physicalAddress[1])
+	{
+		hal_info(GREEN "[CEC] %s %02X%02X: switched to the box\n" NORMAL, what, path[0], path[1]);
+		active_source = true;
+		if (standby)
+			Notify(VIDEO_HDMI_CEC_EVENT_WAKEUP);
+		SendActiveSource();
+	}
+	else
+	{
+		hal_info(GREEN "[CEC] %s %02X%02X: switched away from the box (%02X%02X)\n" NORMAL, what, path[0], path[1], physicalAddress[0], physicalAddress[1]);
+		if (active_source && !standby)
+			Notify(VIDEO_HDMI_CEC_EVENT_SLEEP);
+		active_source = false;
+	}
 }
 
 void hdmi_cec::SendCECMessage(struct cec_message &txmessage, int sleeptime)
@@ -414,13 +465,8 @@ void hdmi_cec::SetCECState(bool state)
 
 		GetCECAddressInfo();
 
-		message.initiator = logicalAddress;
-		message.destination = CEC_LOG_ADDR_BROADCAST;
-		message.data[0] = CEC_MSG_ACTIVE_SOURCE;
-		message.data[1] = physicalAddress[0];
-		message.data[2] = physicalAddress[1];
-		message.length = 3;
-		SendCECMessage(message);
+		active_source = true;
+		SendActiveSource();
 
 		message.initiator = logicalAddress;
 		message.destination = CEC_LOG_ADDR_BROADCAST;
@@ -485,14 +531,34 @@ long hdmi_cec::translateKey(unsigned char code)
 		case CEC_USER_CONTROL_CODE_CHANNEL_DOWN:
 			key = KEY_CHANNELDOWN;
 			break;
+#if BOXMODEL_VUPLUS_ALL
 		case CEC_USER_CONTROL_CODE_PLAY:
 			key = KEY_PLAY;
 			break;
-		case CEC_USER_CONTROL_CODE_STOP:
-			key = KEY_STOP;
+		case CEC_USER_CONTROL_CODE_PAUSE:
+			key = KEY_PLAYPAUSE;
+			break;
+#elif HAVE_ARM_HARDWARE
+		// one key for both on these boxes (from neutrino-tangos evo)
+		case CEC_USER_CONTROL_CODE_PLAY:
+		case CEC_USER_CONTROL_CODE_PAUSE:
+			key = KEY_PLAYPAUSE;
+			break;
+#else
+		case CEC_USER_CONTROL_CODE_PLAY:
+			key = KEY_PLAY;
 			break;
 		case CEC_USER_CONTROL_CODE_PAUSE:
 			key = KEY_PAUSE;
+			break;
+#endif
+		case CEC_USER_CONTROL_CODE_STOP:
+			key = KEY_STOP;
+			break;
+		case CEC_USER_CONTROL_CODE_POWER:
+		case CEC_USER_CONTROL_CODE_POWER_TOGGLE_FUNCTION:
+		case CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION:
+			key = KEY_POWER;
 			break;
 		case CEC_USER_CONTROL_CODE_RECORD:
 			key = KEY_RECORD;
@@ -602,6 +668,10 @@ void hdmi_cec::run()
 
 	std::array<struct epoll_event, EPOLL_MAX_EVENTS> events;
 
+	GetCECAddressInfo();
+	if (autoview_cec_activ)
+		SetCECState(false);
+
 	while (running)
 	{
 		n = epoll_wait(epollfd, events.data(), EPOLL_MAX_EVENTS, EPOLL_WAIT_TIMEOUT);
@@ -666,17 +736,26 @@ void hdmi_cec::Receive(int what)
 
 			switch (rxmessage.opcode)
 			{
-				//case CEC_OPCODE_ACTIVE_SOURCE:
 				case CEC_OPCODE_REQUEST_ACTIVE_SOURCE:
 				{
-					txmessage.destination = CEC_LOG_ADDR_BROADCAST; //rxmessage.initiator;
-					txmessage.initiator = logicalAddress; //rxmessage.destination;
-					txmessage.data[0] = CEC_MSG_ACTIVE_SOURCE;
-					txmessage.data[1] = physicalAddress[0];
-					txmessage.data[2] = physicalAddress[1];
-					txmessage.length = 3;
-					if (!standby)
-						SendCECMessage(txmessage);
+					// asleep but still the source the television shows: wake (from neutrino-tangos evo)
+					if (standby && active_source)
+						Notify(VIDEO_HDMI_CEC_EVENT_WAKEUP);
+					if (!standby || active_source)
+						SendActiveSource();
+					break;
+				}
+				case CEC_OPCODE_ACTIVE_SOURCE:
+				case CEC_OPCODE_SET_STREAM_PATH:
+				{
+					if (rxmessage.length >= 3)
+						SourceChange(&rxmessage.data[1], ToString((cec_opcode)rxmessage.opcode));
+					break;
+				}
+				case CEC_OPCODE_ROUTING_CHANGE:
+				{
+					if (rxmessage.length >= 5)
+						SourceChange(&rxmessage.data[3], ToString((cec_opcode)rxmessage.opcode));
 					break;
 				}
 				case CEC_OPCODE_REPORT_AUDIO_STATUS:
@@ -725,7 +804,11 @@ void hdmi_cec::Receive(int what)
 				case CEC_OPCODE_STANDBY:
 				{
 					if (rxmessage.initiator == CEC_OP_PRIM_DEVTYPE_TV)
+					{
 						tv_off = true;
+						if (!standby)
+							Notify(VIDEO_HDMI_CEC_EVENT_SLEEP);
+					}
 					break;
 				}
 				case CEC_OPCODE_USER_CONTROL_PRESSED: /* key pressed */
@@ -737,7 +820,14 @@ void hdmi_cec::Receive(int what)
 				{
 					long code = translateKey(pressedkey);
 					hal_info(GREEN "[CEC] decoded key %s (%ld)\n" NORMAL, ToString((cec_user_control_code)pressedkey), code);
-					handleCode(code, keypressed);
+					// power from the television's remote wakes the box, and does nothing while it is on
+					if (code == KEY_POWER)
+					{
+						if (standby && keypressed)
+							Notify(VIDEO_HDMI_CEC_EVENT_POWER);
+					}
+					else
+						handleCode(code, keypressed);
 					break;
 				}
 			}

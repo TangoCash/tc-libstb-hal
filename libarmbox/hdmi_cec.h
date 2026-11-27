@@ -79,7 +79,12 @@ class hdmi_cec : public OpenThreads::Thread
 		int volume;
 		bool fallback;
 		bool tv_off;
+		bool active_source;
 		unsigned char audio_destination;
+		void (*event_callback)(int);
+		void SendActiveSource();
+		void Notify(VIDEO_HDMI_CEC_EVENT event);
+		void SourceChange(const unsigned char *path, const char *what);
 	protected:
 		bool running;
 	public:
@@ -100,6 +105,7 @@ class hdmi_cec : public OpenThreads::Thread
 		bool isMuted() { return muted; };
 		int GetAudioDestination() { return (int)audio_destination; }
 		void SetAudioDestination(int audio_dest);
+		void SetEventCallback(void (*callback)(int)) { event_callback = callback; }
 };
 
 #endif // __HDMI_CEC_H__
