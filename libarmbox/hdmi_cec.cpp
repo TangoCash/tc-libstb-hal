@@ -328,6 +328,7 @@ void hdmi_cec::SendCECMessage(struct cec_message &txmessage, int sleeptime)
 			cec_msg_init(&msg, txmessage.initiator, txmessage.destination);
 			memcpy(&msg.msg[1], txmessage.data, txmessage.length);
 			msg.len = txmessage.length + 1;
+			/* blocking: returns once the message is sent, no pause needed */
 			ioctl(hdmiFd, CEC_TRANSMIT, &msg);
 		}
 		else
@@ -337,9 +338,8 @@ void hdmi_cec::SendCECMessage(struct cec_message &txmessage, int sleeptime)
 			message.length = txmessage.length;
 			memcpy(&message.data, txmessage.data, txmessage.length);
 			::write(hdmiFd, &message, 2 + message.length);
+			usleep(sleeptime * 1000);
 		}
-
-		usleep(sleeptime * 1000);
 	}
 }
 
